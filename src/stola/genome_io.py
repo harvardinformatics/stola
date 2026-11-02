@@ -343,6 +343,9 @@ class FastaAccessor:
             )
         return self._decoded_sequence(resolved)[start:end]
 
+    def sequence_lengths(self) -> dict[str, int]:
+        return {seq_id: record.length for seq_id, record in self.records.items()}
+
     def close(self) -> None:
         self._decoded.clear()
         self.handle.close()
@@ -395,6 +398,10 @@ class TwoBitAccessor:
                 f"Invalid interval {seq_id}:{start}-{end} for sequence length {len(text)}"
             )
         return text[start:end]
+
+    def sequence_lengths(self) -> dict[str, int]:
+        # Read from the .2bit header; no sequence is decoded.
+        return {name: len(sequence) for name, sequence in self.sequences.items()}
 
     def close(self) -> None:
         self._decoded.clear()

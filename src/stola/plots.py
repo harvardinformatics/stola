@@ -9,6 +9,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
+from .chain_qc import ChainQc, DepthSummary
 from .spurious_filter import REJECTED_REASON_ORDER
 
 # overlap_stats.summary.tsv lists one value per projection, so a CNEE with
@@ -293,6 +296,246 @@ def write_sequence_identity_density(
     )
     Path(out_path).write_text(svg, encoding="utf-8")
     return total
+
+
+def write_chain_qc_plots(
+    chain_qc: ChainQc, size_score_path: str | Path, depth_path: str | Path, depth_bin_max: int = 100
+) -> None:
+    """The two chain QC figures: chain size and score densities, with a chain
+    size summary table; and per-base depth across the query and reference
+    genomes, each with its mean and median depth."""
+    sizes = chain_qc.aligned_bases
+    size_rows = [
+        ("Chains", f"{sizes.size:,}"),
+        ("Mean size", f"{sizes.mean():,.0f} bp" if sizes.size else "-"),
+        ("Median size", f"{np.median(sizes):,.0f} bp" if sizes.size else "-"),
+    ]
+    width, height, header = 1200, 540, 70
+    parts = [svg_header(width, height)]
+    parts.append('<text class="title" x="30" y="34">Chain sizes and scores</text>\n')
+    parts.append(
+        '<text class="subtitle" x="30" y="55">Chain size = aligned bases (sum of the '
+        "chain's ungapped block sizes)</text>\n"
+    )
+    parts.append(
+        _log_density_panel_svg(
+            sizes, "Chain size", "Aligned bases per chain (log scale)",
+            0, header, width / 2, height - header, size_rows,
+        )
+    )
+    parts.append(
+        _log_density_panel_svg(
+            chain_qc.scores, "Chain score", "Chain score (log scale)",
+            width / 2, header, width / 2, height - header,
+        )
+    )
+    parts.append("</svg>\n")
+    Path(size_score_path).write_text("".join(parts), encoding="utf-8")
+
+    width, panel_height, header, gap = 1100, 420, 70, 24
+    parts = [svg_header(width, header + 2 * panel_height + gap)]
+    parts.append('<text class="title" x="30" y="34">Per-base chain depth</text>\n')
+    parts.append(
+        '<text class="subtitle" x="30" y="55">Chains with an aligned block over each '
+        "base, over every base of each genome (uncovered bases are depth 0)</text>\n"
+    )
+    for index, (genome, depth) in enumerate(
+        (("Query", chain_qc.query_depth), ("Reference", chain_qc.ref_depth))
+    ):
+        parts.append(
+            _depth_panel_svg(
+                depth,
+                f"{genome} genome: {depth.total_bases:,} bp, "
+                f"{100 * depth.covered_fraction:.1f}% covered by at least one chain",
+                depth_bin_max,
+                0, header + index * (panel_height + gap), width, panel_height,
+            )
+        )
+    parts.append("</svg>\n")
+    Path(depth_path).write_text("".join(parts), encoding="utf-8")
+
+
+def _log_density_panel_svg(
+    values: np.ndarray,
+    title: str,
+    x_label: str,
+    x0: float,
+    y0: float,
+    width: float,
+    height: float,
+    table_rows: list[tuple[str, str]] | None = None,
+    bins: int = 100,
+) -> str:
+    # A smoothed density of log10(values), for values spanning many orders of
+    # magnitude, as an SVG group placed at (x0, y0). Non-positive values have
+    # no log and are left out.
+    left, right, top, bottom = 70, 25, 40, 56
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    baseline = top + plot_height
+
+    positive = np.asarray(values, dtype=np.float64)
+    positive = positive[positive > 0]
+    densities: list[float] = []
+    lo_exp, hi_exp = 0, 1
+    if positive.size:
+        logs = np.log10(positive)
+        lo_exp, hi_exp = math.floor(logs.min()), math.ceil(logs.max())
+        hi_exp = max(hi_exp, lo_exp + 1)
+        counts, _ = np.histogram(logs, bins=bins, range=(lo_exp, hi_exp))
+        bin_width = (hi_exp - lo_exp) / bins
+        densities = _moving_average((counts / (positive.size * bin_width)).tolist(), radius=2)
+    max_value = max(densities, default=0.0)
+
+    parts = [f'<g transform="translate({x0} {y0})">\n']
+    parts.append(f'<text class="label" x="{left}" y="20" font-weight="700">{html.escape(title)}</text>\n')
+    tick_count = 5
+    for tick in range(tick_count + 1):
+        value = max_value * tick / tick_count
+        y = _scale_y(value, max_value, top, plot_height)
+        parts.append(f'<line class="grid" x1="{left}" y1="{y:.2f}" x2="{width - right}" y2="{y:.2f}"/>\n')
+        parts.append(f'<text class="tick" x="{left - 8}" y="{y + 4:.2f}" text-anchor="end">{value:.2g}</text>\n')
+    for exponent in range(lo_exp, hi_exp + 1):
+        x = left + (exponent - lo_exp) / (hi_exp - lo_exp) * plot_width
+        parts.append(f'<line class="axis" x1="{x:.2f}" y1="{baseline}" x2="{x:.2f}" y2="{baseline + 5}"/>\n')
+        parts.append(
+            f'<text class="tick" x="{x:.2f}" y="{baseline + 20}" text-anchor="middle">'
+            f"{_power_of_ten_label(exponent)}</text>\n"
+        )
+    parts.append(f'<line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{baseline}"/>\n')
+    parts.append(f'<line class="axis" x1="{left}" y1="{baseline}" x2="{width - right}" y2="{baseline}"/>\n')
+    if densities:
+        points = " ".join(
+            f"{left + (index + 0.5) / len(densities) * plot_width:.2f},"
+            f"{_scale_y(value, max_value, top, plot_height):.2f}"
+            for index, value in enumerate(densities)
+        )
+        parts.append(
+            f'<polygon points="{left:.2f},{baseline:.2f} {points} {width - right:.2f},{baseline:.2f}" '
+            'fill="#b9dcff" opacity="0.7"/>\n'
+        )
+        parts.append(f'<polyline points="{points}" fill="none" stroke="#1f6feb" stroke-width="2.5"/>\n')
+    parts.append(
+        f'<text class="label" x="{left + plot_width / 2}" y="{height - 12}" '
+        f'text-anchor="middle">{html.escape(x_label)}</text>\n'
+    )
+    parts.append(
+        f'<text class="label" transform="translate(18 {top + plot_height / 2}) rotate(-90)" '
+        'text-anchor="middle">Density</text>\n'
+    )
+    if table_rows:
+        parts.append(_table_svg(table_rows, width - right - 200, top + 8, 200))
+    parts.append("</g>\n")
+    return "".join(parts)
+
+
+def _power_of_ten_label(exponent: int) -> str:
+    # Axis label for 10**exponent: 1, 10, 100, 1k, ..., 100G.
+    for unit, unit_exponent in (("G", 9), ("M", 6), ("k", 3)):
+        if exponent >= unit_exponent:
+            return f"{10 ** (exponent - unit_exponent)}{unit}"
+    return f"{10.0 ** exponent:g}"
+
+
+def _depth_panel_svg(
+    depth: DepthSummary,
+    title: str,
+    bin_max: int,
+    x0: float,
+    y0: float,
+    width: float,
+    height: float,
+) -> str:
+    # One genome's per-base depth distribution as an SVG group placed at
+    # (x0, y0): the fraction of bases at each depth 0..bin_max plus one
+    # ">bin_max" overflow bin, on a log axis, with a mean/median table.
+    left, right, top, bottom = 60, 20, 36, 46
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    baseline = top + plot_height
+
+    histogram = depth.histogram
+    total = max(depth.total_bases, 1)
+    fractions = [int(histogram[d]) / total if d < histogram.size else 0.0 for d in range(bin_max + 1)]
+    fractions.append(int(histogram[bin_max + 1 :].sum()) / total)
+    positive = [fraction for fraction in fractions if fraction > 0]
+    min_exp = math.floor(math.log10(min(positive))) if positive else -1
+    max_exp = 0
+
+    slot = plot_width / (bin_max + 2)
+    bar_width = slot * 0.85
+    parts = [f'<g transform="translate({x0} {y0})">\n']
+    parts.append(f'<text class="label" x="{left}" y="20" font-weight="700">{html.escape(title)}</text>\n')
+    for exponent in range(min_exp, max_exp + 1):
+        y = _log_range_y(10.0**exponent, min_exp, max_exp, top, plot_height)
+        parts.append(f'<line class="grid" x1="{left}" y1="{y:.2f}" x2="{width - right}" y2="{y:.2f}"/>\n')
+        label = f"1e{exponent}" if exponent else "1"
+        parts.append(f'<text class="tick" x="{left - 8}" y="{y + 4:.2f}" text-anchor="end">{label}</text>\n')
+    parts.append(f'<line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{baseline}"/>\n')
+    parts.append(f'<line class="axis" x1="{left}" y1="{baseline}" x2="{width - right}" y2="{baseline}"/>\n')
+
+    tick_step = max(bin_max // 10, 1)
+    for bin_index, fraction in enumerate(fractions):
+        x = left + bin_index * slot + (slot - bar_width) / 2
+        y = _log_range_y(fraction, min_exp, max_exp, top, plot_height)
+        if y < baseline:
+            parts.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" '
+                f'height="{baseline - y:.2f}" fill="#1f6feb"/>\n'
+            )
+        # bin_max itself is unlabeled: it sits right next to the overflow label.
+        if bin_index == bin_max + 1:
+            label = f">{bin_max}"
+        elif bin_index % tick_step == 0 and bin_index != bin_max:
+            label = str(bin_index)
+        else:
+            continue
+        parts.append(
+            f'<text class="tick" x="{x + bar_width / 2:.2f}" y="{baseline + 16}" '
+            f'text-anchor="middle">{label}</text>\n'
+        )
+    parts.append(
+        f'<text class="label" x="{left + plot_width / 2}" y="{height - 6}" text-anchor="middle">'
+        "Per-base depth (chains with an aligned block over the base)</text>\n"
+    )
+    parts.append(
+        f'<text class="label" transform="translate(16 {top + plot_height / 2}) rotate(-90)" '
+        'text-anchor="middle">Fraction of bases</text>\n'
+    )
+    parts.append(
+        _table_svg(
+            [("Mean depth", f"{depth.mean:.2f}"), ("Median depth", str(depth.median))],
+            width - right - 170, top + 6, 170,
+        )
+    )
+    parts.append("</g>\n")
+    return "".join(parts)
+
+
+def _log_range_y(value: float, min_exp: float, max_exp: float, plot_top: float, plot_height: float) -> float:
+    # log10 axis from 10^min_exp (baseline) to 10^max_exp; a non-positive
+    # value sits on the baseline.
+    if value <= 0:
+        return plot_top + plot_height
+    exponent = min(max_exp, max(min_exp, math.log10(value)))
+    frac = (exponent - min_exp) / (max_exp - min_exp) if max_exp > min_exp else 1.0
+    return plot_top + plot_height - frac * plot_height
+
+
+def _table_svg(rows: list[tuple[str, str]], x: float, y: float, width: float) -> str:
+    # A small boxed table of (label, value) rows, values right-aligned.
+    parts = [
+        f'<rect x="{x}" y="{y}" width="{width}" height="{18 * len(rows) + 10}" '
+        'fill="#f8fafc" stroke="#d9e2ec" stroke-width="1"/>\n'
+    ]
+    for index, (label, value) in enumerate(rows, start=1):
+        row_y = y + 18 * index
+        parts.append(f'<text class="table-text" x="{x + 8}" y="{row_y}">{html.escape(label)}</text>\n')
+        parts.append(
+            f'<text class="table-text" x="{x + width - 8}" y="{row_y}" text-anchor="end">'
+            f"{html.escape(value)}</text>\n"
+        )
+    return "".join(parts)
 
 
 def _moving_average(values: list[float], radius: int) -> list[float]:

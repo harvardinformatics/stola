@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -532,8 +533,12 @@ class WorkflowTests(unittest.TestCase):
         texts = [message for message, _, _ in messages]
         self.assertTrue(texts[0].startswith("Indexed 3 chains"), texts)
         self.assertEqual(
-            [text.split(" -> ")[0] for text in texts if text.startswith("Wrote")][:2],
-            ["Wrote 3 candidate chain/CNEE pairs", "Wrote 3 all overlap-stat rows"],
+            [text.split(" -> ")[0] for text in texts if text.startswith("Wrote")][:3],
+            [
+                "Wrote 3 candidate chain/CNEE pairs",
+                "Wrote chain size/score and per-base depth plots for 3 chains",
+                "Wrote 3 all overlap-stat rows",
+            ],
         )
         # Messages arrive between stages, not all at the end: the indexing
         # message comes before overlap stats are written, and the overlap
@@ -592,6 +597,107 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(plain_chain.read_text(encoding="utf-8"), CHAIN_TEXT)
             self.assertFalse((work_dir / "chain_index.json").exists())
             self.assertFalse((work_dir / "candidate_chains.tsv").exists())
+
+    def test_chain_qc_matches_per_base_count_from_iter_chain_blocks(self) -> None:
+        from unittest import mock
+
+        from stola import chain_qc
+        from stola.chain import iter_chain_blocks
+
+        rng = random.Random(11)
+        ref_sizes = {"chr1": 600, "chr2": 400}
+        query_sizes = {"chrQ": 500, "chrQ2.1": 450}
+        chain_texts = []
+        for chain_id in range(1, 41):
+            ref_chrom = rng.choice(sorted(ref_sizes))
+            query_chrom = rng.choice(sorted(query_sizes))
+            blocks = [
+                (rng.randint(1, 15), rng.randint(0, 8), rng.randint(0, 8))
+                for _ in range(rng.randint(1, 6))
+            ]
+            ref_span = sum(size + dt for size, dt, _ in blocks) - blocks[-1][1]
+            query_span = sum(size + dq for size, _, dq in blocks) - blocks[-1][2]
+            ref_start = rng.randint(0, ref_sizes[ref_chrom] - ref_span)
+            query_start = rng.randint(0, query_sizes[query_chrom] - query_span)
+            # Chains name chrQ2 without its accession version, as an alias.
+            query_name = "chrQ2" if query_chrom == "chrQ2.1" else query_chrom
+            lines = [
+                f"chain {rng.randint(1000, 10**7)} {ref_chrom} {ref_sizes[ref_chrom]} + "
+                f"{ref_start} {ref_start + ref_span} {query_name} {query_sizes[query_chrom]} "
+                f"{rng.choice('+-')} {query_start} {query_start + query_span} {chain_id}"
+            ]
+            for size, dt, dq in blocks[:-1]:
+                first_sep, second_sep = rng.choice(" \t"), rng.choice(" \t")
+                lines.append(f"{size}{first_sep}{dt}{second_sep}{dq}")
+            lines.append(str(blocks[-1][0]))
+            chain_texts.append("\n".join(lines) + "\n")
+
+        # Expected, base by base: every base of each genome, including a
+        # sequence no chain touches (chrRefOnly, chrUnplaced).
+        ref_lengths = {**ref_sizes, "chrRefOnly": 70}
+        query_lengths = {**query_sizes, "chrUnplaced": 90}
+        ref_depth = {name: [0] * size for name, size in ref_lengths.items()}
+        query_depth = {name: [0] * size for name, size in query_lengths.items()}
+        expected_aligned = []
+        for text in chain_texts:
+            header = text.split()
+            query_chrom = "chrQ2.1" if header[7] == "chrQ2" else header[7]
+            blocks = iter_chain_blocks(text)
+            expected_aligned.append(sum(block.ref_end - block.ref_start for block in blocks))
+            for block in blocks:
+                for base in range(block.ref_start, block.ref_end):
+                    ref_depth[header[2]][base] += 1
+                for base in range(block.query_start, block.query_end):
+                    query_depth[query_chrom][base] += 1
+
+        def expected_histogram(depths):
+            counts = Counter(d for per_base in depths.values() for d in per_base)
+            return [counts[d] for d in range(max(counts) + 1)]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chain = Path(tmpdir) / "test.chain"
+            chain.write_text("\n".join(chain_texts), encoding="utf-8")
+            chain_index = build_index(chain, Path(tmpdir) / "index.json")
+            for batch_bytes, sweep_chunk in [(chain_qc.BATCH_BYTES, chain_qc.SWEEP_CHUNK), (300, 7)]:
+                with self.subTest(batch_bytes=batch_bytes, sweep_chunk=sweep_chunk), mock.patch.multiple(
+                    chain_qc, BATCH_BYTES=batch_bytes, SWEEP_CHUNK=sweep_chunk
+                ):
+                    qc = chain_qc.compute_chain_qc(
+                        chain_index, ref_lengths, query_lengths, None, {"chrQ2": "chrQ2.1"}
+                    )
+                    self.assertEqual(qc.aligned_bases.tolist(), expected_aligned)
+                    self.assertEqual(
+                        qc.scores.tolist(), [int(text.split()[1]) for text in chain_texts]
+                    )
+                    for summary, depths, lengths in [
+                        (qc.ref_depth, ref_depth, ref_lengths),
+                        (qc.query_depth, query_depth, query_lengths),
+                    ]:
+                        per_base = sorted(d for values in depths.values() for d in values)
+                        self.assertEqual(summary.histogram.tolist(), expected_histogram(depths))
+                        self.assertEqual(summary.total_bases, sum(lengths.values()))
+                        self.assertAlmostEqual(summary.mean, sum(per_base) / len(per_base))
+                        self.assertEqual(summary.median, per_base[(len(per_base) - 1) // 2])
+
+    def test_chain_qc_plots_show_the_summary_tables(self) -> None:
+        import numpy as np
+
+        from stola.chain_qc import ChainQc, DepthSummary
+        from stola.plots import write_chain_qc_plots
+
+        depth = DepthSummary(np.array([50, 30, 20]), 100, 0.7, 1, 0.5)
+        qc = ChainQc(np.array([10, 200, 3000]), np.array([5000, 90000, 10**7]), depth, depth)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            size_score, depth_path = Path(tmpdir) / "a.svg", Path(tmpdir) / "b.svg"
+            write_chain_qc_plots(qc, size_score, depth_path)
+            size_svg = size_score.read_text(encoding="utf-8")
+            depth_svg = depth_path.read_text(encoding="utf-8")
+
+        for text in ["Chain size", "Chain score", ">Chains<", ">3<", ">1,070 bp<", ">200 bp<"]:
+            self.assertIn(text, size_svg)
+        for text in ["Query genome: 100 bp, 50.0% covered", "Reference genome", ">0.70<", ">1<"]:
+            self.assertIn(text, depth_svg)
+        self.assertLess(depth_svg.index("Query genome"), depth_svg.index("Reference genome"))
 
     def test_classification_reports_filtering_progress(self) -> None:
         if not _has_networkx():
@@ -694,12 +800,14 @@ class WorkflowTests(unittest.TestCase):
             bed_lines = result.query_bed_path.read_text(encoding="utf-8").splitlines()
             summary_rows = _read_tsv(result.summary_path)
             orthology_rows = _read_tsv(result.orthology_path)
-            summary_figures =sorted(path.name for path in (tmp_path / "summary_figures").iterdir())
+            summary_figures = sorted(path.name for path in (tmp_path / "summary_figures").iterdir())
 
         self.assertEqual(result.summary_path, tmp_path / "summary_figures" / "overlap_stats.summary.tsv")
         self.assertEqual(
             summary_figures,
             [
+                "chain_depth_density.svg",
+                "chain_size_score_density.svg",
                 "final_category_counts.svg",
                 "final_category_counts.tsv",
                 "initial_to_final_reassignment.svg",

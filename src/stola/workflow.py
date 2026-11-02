@@ -9,6 +9,7 @@ from typing import Callable
 
 from .bed import bed_missing_name_column, parse_bed, write_named_bed
 from .candidates import write_candidates
+from .chain_qc import ChainQc, compute_chain_qc
 from .index import build_index
 from .orthology import (
     DEFAULT_FLANK_ANY_COVERAGE_THRESHOLD,
@@ -21,7 +22,13 @@ from .orthology import (
     classify_orthology,
 )
 from .overlap import write_overlap_stats
-from .plots import OrthologySummaryResult, PlotResult, write_orthology_summary, write_qc_plots
+from .plots import (
+    OrthologySummaryResult,
+    PlotResult,
+    write_chain_qc_plots,
+    write_orthology_summary,
+    write_qc_plots,
+)
 from .sequence_compare import SequenceComparator
 from .summary import summarize_overlap_stats
 
@@ -36,6 +43,8 @@ SUMMARY_FILENAME = "overlap_stats.summary.tsv"
 ALIGNMENT_HISTOGRAM_FILENAME = "num_query_alignments.svg"
 OVERLAP_DENSITY_FILENAME = "overlap_fraction_density.svg"
 SEQUENCE_IDENTITY_DENSITY_FILENAME = "sequence_identity_density.svg"
+CHAIN_SIZE_SCORE_FILENAME = "chain_size_score_density.svg"
+CHAIN_DEPTH_FILENAME = "chain_depth_density.svg"
 QUERY_ORTHOLOGY_FILENAME = "query_ortho_status.tsv"
 PRUNED_PROJECTIONS_FILENAME = "pruned_query_projections.tsv"
 REF_ORTHOLOGY_FILENAME = "ref_ortho_status.tsv"
@@ -51,6 +60,7 @@ class WorkflowResult:
     query_bed_count: int
     summary_count: int
     summary_plots: PlotResult
+    chain_qc: ChainQc
     orthology_summary: OrthologySummaryResult
     orthology_result: OrthologyResult
     outdir: Path
@@ -133,9 +143,25 @@ def run_workflow(
     report(f"Indexed {chain_count} chains")
     candidate_count = write_candidates(chain_index, cnee_bed, candidates_path)
     report(f"Wrote {candidate_count} candidate chain/CNEE pairs -> {candidates_path}")
-    report("Computing overlap stats and sequence identity for each candidate ...")
+    report("Summarizing chain sizes, scores and per-base depth ...")
     sequence_comparator = SequenceComparator(ref_fasta, query_fasta, work_dir)
     try:
+        ref, query = sequence_comparator.ref, sequence_comparator.query
+        chain_qc = compute_chain_qc(
+            chain_index,
+            ref.sequence_lengths(),
+            query.sequence_lengths(),
+            ref.aliases,
+            query.aliases,
+        )
+        write_chain_qc_plots(
+            chain_qc, summary_dir / CHAIN_SIZE_SCORE_FILENAME, summary_dir / CHAIN_DEPTH_FILENAME
+        )
+        report(
+            f"Wrote chain size/score and per-base depth plots for {chain_count} chains -> "
+            f"{summary_dir / CHAIN_SIZE_SCORE_FILENAME}, {summary_dir / CHAIN_DEPTH_FILENAME}"
+        )
+        report("Computing overlap stats and sequence identity for each candidate ...")
         stats_count = write_overlap_stats(
             chain_index,
             candidates_path,
@@ -227,6 +253,7 @@ def run_workflow(
         query_bed_count=orthology_result.query_bed_rows,
         summary_count=summary_count,
         summary_plots=summary_plots,
+        chain_qc=chain_qc,
         orthology_summary=orthology_summary,
         orthology_result=orthology_result,
         outdir=outdir_path,
