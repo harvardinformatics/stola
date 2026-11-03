@@ -84,6 +84,22 @@ def _write_fasta_inputs(tmp_path: Path) -> tuple[Path, Path]:
     return ref_fasta, query_fasta
 
 
+@contextlib.contextmanager
+def _open_genomes(tmp_path: Path, query_fasta: Path | None = None):
+    # classify_orthology requires both genomes (as a SequenceComparator).
+    # Tests that only care about the query genome (or neither) get tiny
+    # stand-ins, written to their own subdirectory so they can't clobber a
+    # test's own FASTA files.
+    genome_dir = tmp_path / "genomes"
+    genome_dir.mkdir(exist_ok=True)
+    ref_fasta, default_query = _write_fasta_inputs(genome_dir)
+    comparator = SequenceComparator(ref_fasta, query_fasta or default_query, genome_dir / "work")
+    try:
+        yield comparator
+    finally:
+        comparator.close()
+
+
 # UCSC .2bit two-bit-per-base encoding, empirically verified by round-tripping
 # through Bio.SeqIO.TwoBitIO.TwoBitIterator (Biopython's decoder is a compiled
 # extension, so this was confirmed by brute-force trial rather than taken on
@@ -822,11 +838,11 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(result.summary_plots.histogram_n, 3)
         summary = result.orthology_summary
-        # No query FASTA gap convention can be inferred from this tiny fixture,
-        # so the lost ref collapses to missing/loss.
+        # The fixture's query genome has no N-runs at all (gapless), so the
+        # lost ref's chain gap can't be an assembly gap: probable_loss.
         self.assertEqual(
             summary.final_category_counts,
-            {"uncertain_loss": 1, "missing/loss": 1, "unaligned": 1},
+            {"uncertain_loss": 1, "probable_loss": 1, "unaligned": 1},
         )
         self.assertEqual(summary.reassignment_counts["one2many"], {"uncertain_loss": 1})
         # Both CNEE_PARTIAL projections fail the single-chain flank check;
@@ -1025,14 +1041,16 @@ class WorkflowTests(unittest.TestCase):
 
             # No multi-projection refs here, so filtering is off and the
             # index path is never touched.
-            result = classify_orthology(
-                stats,
-                bed,
-                tmp_path / "unused_index.json",
-                orthology,
-                query_bed,
-                filter_multi_projections=False,
-            )
+            with _open_genomes(tmp_path) as genomes:
+                result = classify_orthology(
+                    stats,
+                    bed,
+                    tmp_path / "unused_index.json",
+                    orthology,
+                    query_bed,
+                    sequence_comparator=genomes,
+                    filter_multi_projections=False,
+                )
             rows = _read_tsv(orthology)
             bed_lines = query_bed.read_text(encoding="utf-8").splitlines()
 
@@ -1098,15 +1116,17 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = classify_orthology(
-                stats,
-                bed,
-                tmp_path / "unused_index.json",
-                orthology,
-                query_bed,
-                filter_multi_projections=False,
-                query_id_prefix="cust_",
-            )
+            with _open_genomes(tmp_path) as genomes:
+                result = classify_orthology(
+                    stats,
+                    bed,
+                    tmp_path / "unused_index.json",
+                    orthology,
+                    query_bed,
+                    sequence_comparator=genomes,
+                    filter_multi_projections=False,
+                    query_id_prefix="cust_",
+                )
             rows = _read_tsv(orthology)
             bed_lines = query_bed.read_text(encoding="utf-8").splitlines()
 
@@ -1151,15 +1171,17 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            classify_orthology(
-                stats,
-                bed,
-                tmp_path / "unused_index.json",
-                orthology,
-                query_bed,
-                filter_multi_projections=False,
-                query_id_prefix="aphWoo",
-            )
+            with _open_genomes(tmp_path) as genomes:
+                classify_orthology(
+                    stats,
+                    bed,
+                    tmp_path / "unused_index.json",
+                    orthology,
+                    query_bed,
+                    sequence_comparator=genomes,
+                    filter_multi_projections=False,
+                    query_id_prefix="aphWoo",
+                )
             rows = _read_tsv(orthology)
 
         query_ids = {row["query_cnee_id"] for row in rows}
@@ -1513,16 +1535,17 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = classify_orthology(
-                stats,
-                bed,
-                index,
-                orthology,
-                query_bed,
-                filter_multi_projections=True,
-                query_fasta=query_fasta,
-                out_ref_cnees=ref_cnees,
-            )
+            with _open_genomes(tmp_path, query_fasta) as genomes:
+                result = classify_orthology(
+                    stats,
+                    bed,
+                    index,
+                    orthology,
+                    query_bed,
+                    sequence_comparator=genomes,
+                    filter_multi_projections=True,
+                    out_ref_cnees=ref_cnees,
+                )
             ref_rows = {row["ref_cnee_id"]: row for row in _read_tsv(ref_cnees)}
 
         self.assertEqual(result.ref_cnee_rows, 5)
@@ -1548,75 +1571,130 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(ref_rows["CNEE_NO_CHAIN"]["orthology_category"], "unaligned")
         self.assertEqual(ref_rows["CNEE_NO_CHAIN"]["pre_pruning_category"], "unaligned")
 
-    def test_ref_cnee_tsv_collapses_lost_categories_without_query_fasta(self) -> None:
-        if not _has_networkx():
-            self.skipTest("networkx is not installed")
+    def test_gap_convention_levels(self) -> None:
+        from stola.assembly_gaps import NRun, infer_gap_convention
+
+        def verdict(lengths: list[int]) -> tuple[str, set[int]]:
+            runs = [NRun("chrQ", i * 1000, i * 1000 + length) for i, length in enumerate(lengths)]
+            convention = infer_gap_convention(runs, min_gap_length=10)
+            return convention.confidence, set(convention.boundary_lengths)
+
+        spread = [12, 15, 21, 27, 33, 39, 44, 50, 58, 66]
+        self.assertEqual(verdict([]), ("none", set()))
+        self.assertEqual(verdict([50, 50, 50]), ("none", set()))  # too few to infer
+        # Runs shorter than min_gap_length are ambiguous bases: never gap
+        # markers, and they don't count toward MIN_RUNS_FOR_INFERENCE.
+        self.assertEqual(verdict([1] * 20 + [100] * 9), ("none", set()))
+        self.assertEqual(verdict([100] * 9 + [37] + [1] * 20), ("high", {100}))
+        self.assertEqual(verdict([100] * 5 + [25] * 5), ("medium", {100, 25}))
+        self.assertEqual(verdict(spread + [1, 3, 9]), ("estimated", set(spread)))
+
+    def _classify_lost_refs_against_query(self, query_sequence: str) -> dict[str, str]:
+        # One chain with aligned blocks A (ref[100,150) query[1000,1050)),
+        # B (ref[400,450) query[1200,1250)) and C (ref[700,750) query[1400,1450)).
+        # CNEE_LOST_GAP sits in the A/B ref gap, query-side gap [1050,1200);
+        # CNEE_LOST_REAL sits in the B/C ref gap, query-side gap [1250,1400);
+        # CNEE_LOST_CHAIN_END sits past block C, with no aligned block after it
+        # (stats are hand-written, so this exercises that branch directly).
+        from stola.index import build_index
         from stola.orthology import classify_orthology
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             bed = tmp_path / "cnees.bed"
             stats = tmp_path / "stats.tsv"
-            orthology = tmp_path / "orthology.tsv"
-            query_bed = tmp_path / "query.bed"
-            ref_cnees = tmp_path / "ref_cnees.tsv"
             chain = tmp_path / "test.chain"
             index = tmp_path / "index.json"
+            query_fasta = tmp_path / "query.fa"
+            ref_cnees = tmp_path / "ref_cnees.tsv"
 
-            bed.write_text("chr1\t300\t350\tCNEE_LOST_GAP\n", encoding="utf-8")
-            chain.write_text(
-                "\n".join(
-                    [
-                        "chain 100 chr1 1000 + 100 750 chrQ 3000 + 1000 1450 1",
-                        "50\t250\t150",
-                        "50\t250\t150",
-                        "50",
-                        "",
-                    ]
-                ),
+            bed.write_text(
+                "chr1\t300\t350\tCNEE_LOST_GAP\n"
+                "chr1\t500\t550\tCNEE_LOST_REAL\n"
+                "chr1\t760\t800\tCNEE_LOST_CHAIN_END\n",
                 encoding="utf-8",
             )
-            from stola.index import build_index
-
+            chain.write_text(
+                "chain 100 chr1 1000 + 100 750 chrQ 3000 + 1000 1450 1\n50\t250\t150\n50\t250\t150\n50\n\n",
+                encoding="utf-8",
+            )
             build_index(chain, index)
-
             columns = [
-                "cnee_uid",
-                "ref_chrom",
-                "ref_start",
-                "ref_end",
-                "chain_id",
-                "aligned_bases",
-                "query_chrom",
-                "query_strand",
-                "query_aligned_start",
-                "query_aligned_end",
-                "query_projection_name",
-                "gap_fraction_within_chain_span",
-                "seq_identity",
+                "cnee_uid", "ref_chrom", "ref_start", "ref_end", "chain_id", "aligned_bases",
+                "query_chrom", "query_strand", "query_aligned_start", "query_aligned_end",
+                "query_projection_name", "gap_fraction_within_chain_span", "seq_identity",
                 "rank_by_chain_score",
             ]
             stats.write_text(
-                "\t".join(columns)
-                + "\n"
-                + "CNEE_LOST_GAP\tchr1\t300\t350\t1\t0\tchrQ\t+\t.\t.\tLOSTGAP#1\t1.0\t.\t1\n",
+                "\t".join(columns) + "\n"
+                + "CNEE_LOST_GAP\tchr1\t300\t350\t1\t0\tchrQ\t+\t.\t.\tLOSTGAP#1\t1.0\t.\t1\n"
+                + "CNEE_LOST_REAL\tchr1\t500\t550\t1\t0\tchrQ\t+\t.\t.\tLOSTREAL#1\t1.0\t.\t1\n"
+                + "CNEE_LOST_CHAIN_END\tchr1\t760\t800\t1\t0\tchrQ\t+\t.\t.\tLOSTEND#1\t1.0\t.\t1\n",
                 encoding="utf-8",
             )
+            _write_fasta(query_fasta, {"chrQ": query_sequence})
+            with _open_genomes(tmp_path, query_fasta) as genomes:
+                classify_orthology(
+                    stats,
+                    bed,
+                    index,
+                    tmp_path / "orthology.tsv",
+                    tmp_path / "query.bed",
+                    sequence_comparator=genomes,
+                    filter_multi_projections=True,
+                    out_ref_cnees=ref_cnees,
+                )
+            return {row["ref_cnee_id"]: row["orthology_category"] for row in _read_tsv(ref_cnees)}
 
-            # No query_fasta at all -- can't even attempt the boundary check.
-            result = classify_orthology(
-                stats,
-                bed,
-                index,
-                orthology,
-                query_bed,
-                filter_multi_projections=True,
-                out_ref_cnees=ref_cnees,
-            )
-            ref_rows = {row["ref_cnee_id"]: row for row in _read_tsv(ref_cnees)}
+    @staticmethod
+    def _query_with_n_runs(runs: list[tuple[int, int]]) -> str:
+        seq = ["A"] * 3000
+        for start, length in runs:
+            seq[start : start + length] = ["N"] * length
+        return "".join(seq)
 
-        self.assertEqual(result.ref_cnee_rows, 1)
-        self.assertEqual(ref_rows["CNEE_LOST_GAP"]["orthology_category"], "missing/loss")
+    def test_lost_refs_with_estimated_gap_sizes_use_every_qualifying_n_run(self) -> None:
+        if not _has_networkx():
+            self.skipTest("networkx is not installed")
+        # 10 N-runs of all-different lengths >= 10bp (none dominates) beyond
+        # the chain: estimated gap sizes, so any N-run >= 10bp marks an
+        # assembly gap -- but a shorter one is still just ambiguous bases.
+        other_runs = [
+            (1500 + i * 140, length) for i, length in enumerate([12, 15, 21, 27, 33, 39, 44, 58, 66, 90])
+        ]
+        for in_gap_length, expected in [(50, "assembly_gap_loss"), (3, "probable_loss")]:
+            with self.subTest(in_gap_length=in_gap_length):
+                query = self._query_with_n_runs([(1100, in_gap_length)] + other_runs)
+                self.assertEqual(
+                    self._classify_lost_refs_against_query(query),
+                    {
+                        "CNEE_LOST_GAP": expected,
+                        "CNEE_LOST_REAL": "probable_loss",
+                        "CNEE_LOST_CHAIN_END": "probable_loss",
+                    },
+                )
+
+    def test_lost_refs_are_probable_losses_without_an_inferable_gap_convention(self) -> None:
+        if not _has_networkx():
+            self.skipTest("networkx is not installed")
+        cases = {
+            "gapless": [],
+            # Plenty of N-runs, but all shorter than min_gap_length.
+            "only short N-runs": [(1100, 5)] + [(1500 + i * 50, 1) for i in range(20)],
+            # One N-run, even one inside CNEE_LOST_GAP's query gap, is too
+            # few to infer a convention, so it isn't trusted as an assembly gap.
+            "too few N-runs": [(1100, 50)],
+        }
+        for label, runs in cases.items():
+            with self.subTest(label):
+                self.assertEqual(
+                    self._classify_lost_refs_against_query(self._query_with_n_runs(runs)),
+                    {
+                        "CNEE_LOST_GAP": "probable_loss",
+                        "CNEE_LOST_REAL": "probable_loss",
+                        "CNEE_LOST_CHAIN_END": "probable_loss",
+                    },
+                )
 
     def test_orthology_clustering_keeps_opposite_strand_overlaps_separate(self) -> None:
         if not _has_networkx():
@@ -1659,14 +1737,16 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = classify_orthology(
-                stats,
-                bed,
-                tmp_path / "unused_index.json",
-                orthology,
-                query_bed,
-                filter_multi_projections=False,
-            )
+            with _open_genomes(tmp_path) as genomes:
+                result = classify_orthology(
+                    stats,
+                    bed,
+                    tmp_path / "unused_index.json",
+                    orthology,
+                    query_bed,
+                    sequence_comparator=genomes,
+                    filter_multi_projections=False,
+                )
             rows = _read_tsv(orthology)
 
         # Overlapping projections on opposite strands must stay separate
@@ -1724,14 +1804,16 @@ class WorkflowTests(unittest.TestCase):
 
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                result = classify_orthology(
-                    stats,
-                    bed,
-                    tmp_path / "unused_index.json",
-                    orthology,
-                    query_bed,
-                    filter_multi_projections=False,
-                )
+                with _open_genomes(tmp_path) as genomes:
+                    result = classify_orthology(
+                        stats,
+                        bed,
+                        tmp_path / "unused_index.json",
+                        orthology,
+                        query_bed,
+                        sequence_comparator=genomes,
+                        filter_multi_projections=False,
+                    )
                 summarize_overlap_stats(stats, summary, cnee_bed=bed)
 
             orthology_rows = _read_tsv(orthology)
@@ -1872,7 +1954,7 @@ class WorkflowTests(unittest.TestCase):
         from stola.orthology import ORTHOLOGY_COLUMNS, REF_CNEE_COLUMNS
 
         categories = {
-            "run_a": {"ce1": "one2one", "ce2": "missing/loss", "ce3": "one2many"},
+            "run_a": {"ce1": "one2one", "ce2": "assembly_gap_loss", "ce3": "one2many"},
             "run_b": {"ce1": "one2one", "ce2": "one2one", "ce3": "probable_loss"},
         }
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1919,7 +2001,7 @@ class WorkflowTests(unittest.TestCase):
             [
                 "ref_ID\trun_a\tlabel_b",
                 "ce1\tone2one\tone2one",
-                "ce2\tmissing/loss\tone2one",
+                "ce2\tassembly_gap_loss\tone2one",
                 "ce3\tone2many\tprobable_loss",
             ],
         )
@@ -1927,7 +2009,7 @@ class WorkflowTests(unittest.TestCase):
             plots, ["ref.loss_frequency_distribution.svg", "ref.multiproj_frequency_distribution.svg"]
         )
         # Index i = number of reference CNEEs lost (or multi-projection) in
-        # exactly i of the two runs; missing/loss and probable_loss both count as lost.
+        # exactly i of the two runs; assembly_gap_loss and probable_loss both count as lost.
         loss_counts, multi_counts = _compute_frequency_distributions(["ce1", "ce2", "ce3"], columns)
         self.assertEqual(loss_counts, [1, 2, 0])
         self.assertEqual(multi_counts, [2, 1, 0])

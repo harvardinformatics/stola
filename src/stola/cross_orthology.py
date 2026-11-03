@@ -54,11 +54,10 @@ FASTA_LINE_WIDTH = 60
 # Reference-only categories from orthology.py -- no query ortholog was found
 # in that sample at all. Any category not recognized as one2one or
 # multi-projection (including a table cell that's "NA" or some future
-# category) is conservatively treated as lost too, rather than silently
-# counted as a usable ortholog.
-LOST_CATEGORIES = frozenset(
-    {"unaligned", "probable_loss", "assembly_gap_loss", "uncertain_loss", "missing/loss"}
-)
+# category, or the "missing/loss" written by older stola versions) is
+# conservatively treated as lost too, rather than silently counted as a
+# usable ortholog.
+LOST_CATEGORIES = frozenset({"unaligned", "probable_loss", "assembly_gap_loss", "uncertain_loss"})
 MULTI_CATEGORIES = frozenset({"one2many", "many2one", "complex/many2many"})
 
 
@@ -904,8 +903,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.3,
         help=(
             "Maximum fraction of samples a ref CNEE can be lost in (a reference-only "
-            "category -- unaligned/probable_loss/assembly_gap_loss/uncertain_loss/"
-            "missing-loss) and still be included in FASTA extraction [default: 0.3]"
+            "category -- unaligned/probable_loss/assembly_gap_loss/uncertain_loss) "
+            "and still be included in FASTA extraction [default: 0.3]"
         ),
     )
     sequence_parser.add_argument(

@@ -31,7 +31,6 @@ REF_CATEGORY_ORDER = [
     "uncertain_loss",
     "probable_loss",
     "assembly_gap_loss",
-    "missing/loss",
     "unaligned",
 ]
 REF_CATEGORY_COLORS = {
@@ -42,7 +41,6 @@ REF_CATEGORY_COLORS = {
     "uncertain_loss": "#c2410c",
     "probable_loss": "#64748b",
     "assembly_gap_loss": "#94a3b8",
-    "missing/loss": "#475569",
     "unaligned": "#111827",
 }
 MULTI_PROJECTION_CATEGORIES = ("one2many", "many2one", "complex/many2many")

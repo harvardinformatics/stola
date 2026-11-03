@@ -43,9 +43,16 @@ Projections of ref CNEEs with more than one candidate (i.e. putative one2many, m
 
 *Reference only:*
 - `unaligned`: ref CNEE does not overlap **any** chain aligned blocks OR gaps
+- `assembly_gap_loss`: ref CNEE occurs in chain gap that is likely a contig boundary (see below)
 - `probable_loss`: ref CNEE occurs in chain gap that does NOT look like contig boundary
-- `assembly_gap_loss`: ref CNEE occurs in chain gap that is likely a contig boundary
 - `uncertain_loss`: ref CNEE with zero projections that passed the filtering steps
+
+Contig boundaries are inferred from the N-runs in the query genome, considering only runs of at least `--min-gap-length` (default 10bp; shorter runs are treated as ambiguous bases, never gaps):
+- **fixed-length gaps** (one, or a few, N-run lengths dominate): N-runs of those lengths are contig boundaries
+- **estimated gap sizes** (10+ N-runs, no dominant length): every N-run is a contig boundary
+- **otherwise** (no N-runs, or fewer than 10): nothing is a contig boundary
+
+A lost CNEE whose chain gap overlaps a contig boundary is `assembly_gap_loss`; every other lost CNEE (including one at the very end of its chain) is `probable_loss`. The inferred case is reported in the run log ("Query assembly gaps: ...").
 
 
 ## Useage

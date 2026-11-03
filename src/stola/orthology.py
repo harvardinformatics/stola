@@ -11,7 +11,12 @@ from typing import Callable, Iterator
 
 import networkx as nx
 
-from .assembly_gaps import DEFAULT_MIN_GAP_LENGTH, NRunIndex, scan_query_assembly_gaps
+from .assembly_gaps import (
+    DEFAULT_MIN_GAP_LENGTH,
+    NRunIndex,
+    describe_gap_convention,
+    scan_query_assembly_gaps,
+)
 from .bed import parse_bed
 from .chain import BlockIndex, _flanking_blocks, iter_chain_blocks, read_chain_text
 from .index import ChainIndex, as_chain_index
@@ -61,11 +66,6 @@ REF_CNEE_COLUMNS = [
     "num_projections_pruned",
     "pre_pruning_category",
 ]
-
-# Fallback ref category for a "lost" ref (chain overlap, zero aligned bases)
-# when the query assembly's gap-marker convention can't be confidently
-# inferred (or no query FASTA was supplied at all) -- see assembly_gaps.py.
-UNCERTAIN_LOSS_TYPE_CATEGORY = "missing/loss"
 
 # Prefix prepended to every graph-assigned query CNEE id (e.g. "q_ce1234").
 DEFAULT_QUERY_ID_PREFIX = "q_"
@@ -171,14 +171,13 @@ def classify_orthology(
     chain_index: ChainIndex | str | Path,
     out_orthology: str | Path,
     out_query_bed: str | Path,
-    sequence_comparator: SequenceComparator | None = None,
+    sequence_comparator: SequenceComparator,
     filter_multi_projections: bool = True,
     soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,
     relative_score_threshold: float = DEFAULT_RELATIVE_SCORE_THRESHOLD,
     flank_window: int = DEFAULT_FLANK_WINDOW,
     flank_any_coverage_threshold: float = DEFAULT_FLANK_ANY_COVERAGE_THRESHOLD,
     out_culled_projections: str | Path | None = None,
-    query_fasta: str | Path | None = None,
     min_gap_length: int = DEFAULT_MIN_GAP_LENGTH,
     out_ref_cnees: str | Path | None = None,
     query_id_prefix: str = DEFAULT_QUERY_ID_PREFIX,
@@ -222,14 +221,20 @@ def classify_orthology(
     every individual rejected projection is also logged there for tracking,
     along with why it was rejected.
 
-    Independently of filtering, when query_fasta is given, every "lost" ref
-    (zero aligned query bases anywhere) is further split into probable_loss
-    or assembly_gap_loss by checking whether its chain gap's query-side span
-    coincides with an inferred contig-boundary N-run in the query assembly
-    (see assembly_gaps.py). When query_fasta is omitted, or the query
-    assembly's gap-length convention can't be confidently inferred, or a
-    given ref's own chain gap is itself ambiguous, this falls back to the
-    collapsed "missing/loss" category instead of guessing. This sub-
+    sequence_comparator supplies both genomes (required): reference/query
+    sequence for scoring projections, and the query genome scanned for
+    assembly gaps below.
+
+    Independently of filtering, every "lost" ref (zero aligned query bases
+    anywhere) is further split into assembly_gap_loss or probable_loss: it
+    is assembly_gap_loss if its chain gap's query-side span overlaps an
+    inferred contig-boundary N-run in the query assembly (see
+    assembly_gaps.py; only N-runs of at least min_gap_length are considered)
+    -- an N-run of the assembly's fixed gap-marker length(s), or any such
+    N-run if it records estimated gap sizes -- and
+    probable_loss otherwise (including a gapless assembly, too few N-runs to
+    infer a convention, or a ref at the very end of its chain, with no
+    aligned block on one side). This sub-
     categorization, plus per-ref pruning counts, is written to out_ref_cnees
     if given (see the README's Output section) -- out_orthology's own
     "lost"/"unaligned" labels are unaffected either way.
@@ -276,12 +281,6 @@ def classify_orthology(
     if filter_multi_projections:
         initial_category_by_ref = _initial_category_by_ref(initial_graph)
         if initial_category_by_ref:
-            if sequence_comparator is None:
-                raise ValueError(
-                    "sequence_comparator is required when filter_multi_projections is True "
-                    "(real ref/query sequence access is needed to score candidate projections "
-                    "against their competitors)"
-                )
             surviving, culled = _filter_multi_projections(
                 evidence.projections,
                 initial_category_by_ref,
@@ -323,19 +322,19 @@ def classify_orthology(
             for ref_id, candidate in evidence.zero_aligned_best_row_by_ref.items()
             if ref_id not in refs_with_any_projection
         }
+        lost_category_by_ref: dict[str, str] = {}
         if lost_gap_candidates:
             report(
                 f"Classifying {len(lost_gap_candidates)} lost reference CNEEs as probable "
                 "or assembly-gap losses ..."
             )
-        n_run_index: NRunIndex | None = None
-        if query_fasta is not None and lost_gap_candidates:
-            gap_convention, candidate_index = scan_query_assembly_gaps(query_fasta, min_gap_length)
-            if gap_convention.confidence != "none":
-                n_run_index = candidate_index
-        lost_category_by_ref = _classify_lost_refs(
-            lost_gap_candidates, chain_records, indexed_chain_path, n_run_index
-        )
+            gap_convention, n_run_index = scan_query_assembly_gaps(
+                sequence_comparator.query_path, min_gap_length
+            )
+            report(f"Query assembly gaps: {describe_gap_convention(gap_convention, min_gap_length)}")
+            lost_category_by_ref = _classify_lost_refs(
+                lost_gap_candidates, chain_records, indexed_chain_path, n_run_index
+            )
         ref_cnee_count = _write_ref_cnee_tsv(
             ref_ids,
             final_clusters,
@@ -598,8 +597,7 @@ def _filter_multi_projections(
 # chain gap (zero aligned query bases) is split into probable_loss (the gap
 # isn't a query assembly artifact) vs assembly_gap_loss (it is), using the
 # query genome's inferred contig-boundary N-runs. Independent of filtering --
-# this always runs (when a query FASTA is available), regardless of
-# filter_multi_projections.
+# this always runs, regardless of filter_multi_projections.
 # --------------------------------------------------------------------------
 
 
@@ -607,23 +605,17 @@ def _classify_lost_refs(
     lost_gap_candidates: dict[str, LostGapCandidate],
     chain_records: list[ChainRecord],
     indexed_chain_path: str | Path,
-    n_run_index: NRunIndex | None,
+    n_run_index: NRunIndex,
 ) -> dict[str, str]:
     """Categorize each "lost" ref as probable_loss / assembly_gap_loss.
 
-    Falls back to UNCERTAIN_LOSS_TYPE_CATEGORY ("missing/loss") whenever the
-    distinction can't be made confidently: n_run_index is None (no query
-    FASTA was supplied, or its gap-length convention couldn't be inferred
-    confidently), or this particular ref's own chain gap is itself ambiguous
-    (no aligned block on one side at all, i.e. it sits at the very edge of
-    its chain's aligned span).
+    assembly_gap_loss iff the query-side span of the ref's chain gap overlaps
+    one of n_run_index's contig-boundary N-runs; everything else is
+    probable_loss -- including every ref when n_run_index is empty (no
+    inferable gap convention), and a ref at the very end of its chain (no
+    aligned block on one side, so no query-side gap span to check).
     """
-    if not lost_gap_candidates:
-        return {}
-
     category_by_ref: dict[str, str] = {}
-    if n_run_index is None:
-        return {ref_id: UNCERTAIN_LOSS_TYPE_CATEGORY for ref_id in lost_gap_candidates}
 
     record_by_chain_id = {record.chain_id: record for record in chain_records}
     block_cache: dict[str, BlockIndex] = {}
@@ -639,7 +631,7 @@ def _classify_lost_refs(
 
             preceding, following = _flanking_blocks(blocks, candidate.ref_start, candidate.ref_end)
             if preceding is None or following is None:
-                category_by_ref[ref_id] = UNCERTAIN_LOSS_TYPE_CATEGORY
+                category_by_ref[ref_id] = "probable_loss"
                 continue
 
             if record.query_strand == "+":
@@ -869,10 +861,10 @@ def _write_ref_cnee_tsv(
 
     orthology_category is the ref-based final category: one2one/one2many/
     many2one/complex/many2many for a ref with a surviving query edge,
-    otherwise unaligned/probable_loss/assembly_gap_loss/"missing/loss"/
-    uncertain_loss. pre_pruning_category is the same value for anything
-    filtering never touches (unaligned, the loss subtypes, and lone one2one
-    edges); for anything that went through filtering it's the raw
+    otherwise unaligned/probable_loss/assembly_gap_loss/uncertain_loss.
+    pre_pruning_category is the same value for anything filtering never
+    touches (unaligned, the loss subtypes, and lone one2one edges); for
+    anything that went through filtering it's the raw
     pre-filtering graph shape, which can differ from the final category
     (e.g. an initial complex/many2many that filtered down to a lone one2one
     edge).
@@ -904,7 +896,7 @@ def _write_ref_cnee_tsv(
                 category = "unaligned"
                 pre_pruning_category = "unaligned"
             elif ref_id not in refs_with_any_projection:
-                category = lost_category_by_ref.get(ref_id, UNCERTAIN_LOSS_TYPE_CATEGORY)
+                category = lost_category_by_ref.get(ref_id, "probable_loss")
                 pre_pruning_category = category
             else:
                 category = "uncertain_loss"

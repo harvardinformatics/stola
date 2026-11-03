@@ -187,7 +187,6 @@ def run_workflow(
             flank_window=flank_window,
             flank_any_coverage_threshold=flank_any_coverage_threshold,
             out_culled_projections=out_culled_projections,
-            query_fasta=query_fasta,
             min_gap_length=min_gap_length,
             out_ref_cnees=out_ref_cnees,
             query_id_prefix=query_id_prefix,

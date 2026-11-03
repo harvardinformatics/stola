@@ -5,10 +5,16 @@ of N bases. Some assemblies pad every "gap of unknown size" to one fixed
 length (a real, but never fully standardized, convention), while others
 record estimated gap sizes instead. Without an AGP file, the only evidence
 available is the empirical distribution of N-run lengths in the genome file
-itself (FASTA or .2bit -- see genome_io.py): when one (or a small handful
-of) length(s) clearly dominate, that's good evidence of a fixed-length
-convention; when lengths are too spread out or there are too few gaps at
-all, there's nothing to confidently infer.
+itself (FASTA or .2bit -- see genome_io.py). Only N-runs of at least
+min_gap_length (default 10bp) are considered at all -- anything shorter is
+more likely an ambiguous basecall than a gap -- and among those:
+
+- one (or a small handful of) length(s) clearly dominate: a fixed-length
+  convention, and only N-runs of those lengths are contig boundaries;
+- plenty of N-runs but no dominant length: the assembly records estimated
+  gap sizes, so every N-run is a contig boundary;
+- otherwise (no N-runs at all, or too few to infer a convention): nothing
+  is treated as a contig boundary.
 """
 
 from __future__ import annotations
@@ -26,7 +32,8 @@ from .genome_io import iter_named_sequences
 N_RUN_RE = re.compile(r"N+")
 
 # Below this length, an isolated N is more likely a single low-confidence
-# basecall embedded in otherwise-real sequence than a deliberate gap marker.
+# basecall embedded in otherwise-real sequence than a deliberate gap marker;
+# such runs are ignored entirely (never a gap, and not counted below).
 DEFAULT_MIN_GAP_LENGTH = 10
 
 # A single length must cover at least this fraction of (length-filtered)
@@ -36,8 +43,8 @@ HIGH_CONFIDENCE_SHARE = 0.7
 # small candidate set "medium confidence".
 MEDIUM_CONFIDENCE_SHARE = 0.8
 MEDIUM_CONFIDENCE_TOP_N = 3
-# Below this many (length-filtered) runs, there's not enough evidence to
-# infer a convention either way, confident or not.
+# Below this many (length-filtered) N-runs, including none at all, there's
+# not enough evidence to infer any convention, and no N-run is a gap.
 MIN_RUNS_FOR_INFERENCE = 10
 
 
@@ -54,14 +61,20 @@ class NRun:
 
 @dataclass(frozen=True)
 class GapConvention:
-    """Result of looking for a fixed-length gap-marker convention.
+    """Result of looking for the query assembly's gap-marker convention.
 
-    confidence is "high" (one dominant length), "medium" (a small set of
-    lengths together dominate), or "none" (too spread out, or too few
-    qualifying N-runs to say anything). boundary_lengths is the set of
-    lengths trusted as deliberate gap markers -- empty when confidence is
-    "none". length_counts is the full, unfiltered length -> count histogram,
-    for reporting regardless of the verdict.
+    confidence is one of:
+      "high"      one dominant length (a fixed-length gap marker);
+      "medium"    a small set of lengths together dominate;
+      "estimated" enough qualifying N-runs, but no dominant length -- the
+                  assembly records estimated gap sizes, so every qualifying
+                  length is trusted as a gap marker;
+      "none"      no qualifying N-runs, or too few to infer a convention:
+                  nothing is a gap marker.
+    Qualifying N-runs are those of at least min_gap_length. boundary_lengths
+    is the set of lengths trusted as deliberate gap markers (empty for
+    "none"). length_counts is the full, unfiltered length -> count
+    histogram, for reporting regardless of the verdict.
     """
 
     confidence: str
@@ -87,29 +100,50 @@ def iter_n_runs(genome_path: str | Path) -> Iterator[NRun]:
 def infer_gap_convention(
     runs: list[NRun], min_gap_length: int = DEFAULT_MIN_GAP_LENGTH
 ) -> GapConvention:
-    # Look for a dominant fixed-length gap-marker convention among runs of
-    # at least min_gap_length; report the full histogram regardless.
+    # Classify the gap-marker convention from runs of at least
+    # min_gap_length; report the full histogram regardless.
     all_length_counts = Counter(run.length for run in runs)
     filtered_counts = Counter(
         {length: count for length, count in all_length_counts.items() if length >= min_gap_length}
     )
-    total_filtered = sum(filtered_counts.values())
+    total = sum(filtered_counts.values())
 
-    if total_filtered < MIN_RUNS_FOR_INFERENCE:
+    if total < MIN_RUNS_FOR_INFERENCE:
         return GapConvention("none", frozenset(), all_length_counts)
 
     ranked = filtered_counts.most_common()
     top_length, top_count = ranked[0]
-    if top_count / total_filtered >= HIGH_CONFIDENCE_SHARE:
+    if top_count / total >= HIGH_CONFIDENCE_SHARE:
         return GapConvention("high", frozenset({top_length}), all_length_counts)
 
     top_n = ranked[:MEDIUM_CONFIDENCE_TOP_N]
-    if sum(count for _, count in top_n) / total_filtered >= MEDIUM_CONFIDENCE_SHARE:
+    if sum(count for _, count in top_n) / total >= MEDIUM_CONFIDENCE_SHARE:
         return GapConvention(
             "medium", frozenset(length for length, _ in top_n), all_length_counts
         )
 
-    return GapConvention("none", frozenset(), all_length_counts)
+    # Spread-out lengths: estimated gap sizes, so every qualifying run is a gap.
+    return GapConvention("estimated", frozenset(filtered_counts), all_length_counts)
+
+
+def describe_gap_convention(
+    convention: GapConvention, min_gap_length: int = DEFAULT_MIN_GAP_LENGTH
+) -> str:
+    """One line saying what was inferred and how lost CNEEs get categorized."""
+    n = sum(c for length, c in convention.length_counts.items() if length >= min_gap_length)
+    runs = f"{n} N-run(s) >= {min_gap_length}bp"
+    if convention.confidence in ("high", "medium"):
+        lengths = "/".join(f"{length}bp" for length in sorted(convention.boundary_lengths))
+        return (f"fixed-length gap marker(s) {lengths} ({convention.confidence} confidence, "
+                f"{runs}); lost CNEEs in those N-runs -> assembly_gap_loss, "
+                "others -> probable_loss")
+    if convention.confidence == "estimated":
+        return (f"estimated gap sizes ({runs}, no dominant length); lost CNEEs in any "
+                f"N-run >= {min_gap_length}bp -> assembly_gap_loss, others -> probable_loss")
+    if n == 0:
+        return f"no N-runs >= {min_gap_length}bp (gapless); all lost CNEEs -> probable_loss"
+    return (f"only {runs}, too few to infer a gap convention; all lost CNEEs "
+            "-> probable_loss")
 
 
 class NRunIndex:

@@ -37,7 +37,6 @@ projections landing there), scoring every chain aligned at that locus once:
 - unaligned: ref CNEE has NO chain overlaps
 - probable loss: ref CNEE overlaps a chain but only in chain gap AND chain gap not a contig boundary
 - assembly gap loss: ref CNEE overlaps a chain but only in chain gap and gap is a contig boundary
-- ALT: missing/loss: if cannot infer contig boundaries, collapse "probable loss" and "assembly gap loss" into this category
 - uncertain loss: ref CNEE has only pruned projections
 
 ## Query CNEE categories
@@ -50,24 +49,30 @@ projections landing there), scoring every chain aligned at that locus once:
 ## Loss sub-categorization (implemented)
 Whether a chain gap is a contig boundary is inferred from the query FASTA
 alone (no AGP): scan for N-runs, and see whether one (or a small handful of)
-length(s) clearly dominate the runs of at least `--min-gap-length` bases --
-see `assembly_gaps.py`. Three outcomes:
+length(s) clearly dominate the runs of at least `--min-gap-length` bases
+(default 10; shorter runs are ambiguous bases, never gaps) -- see
+`assembly_gaps.py`. Four outcomes:
 - **high confidence** (one dominant length): only that length counts as a
   boundary marker.
 - **medium confidence** (a small set of 2-3 lengths together dominate):
   any of those lengths counts as a boundary marker -- some assemblies
   legitimately use more than one fixed-length gap type (e.g. contig-gap vs
   scaffold-gap).
-- **none** (too spread out, or too few qualifying N-runs, or no query FASTA
-  supplied at all): the probable_loss/assembly_gap_loss distinction can't be
-  made confidently, so both collapse into `missing/loss` instead of
-  guessing. A given ref's own chain gap can also individually be ambiguous
-  (no aligned block on one side within its own chain) and falls back to
-  `missing/loss` even when the genome's overall convention is confident.
+- **estimated** (at least `MIN_RUNS_FOR_INFERENCE` qualifying N-runs, but no
+  dominant length): the assembly records estimated gap sizes, so every
+  qualifying N-run counts as a boundary marker. (A hard-masked query genome would also land here,
+  and over-call assembly_gap_loss.)
+- **none** (no qualifying N-runs, or fewer than `MIN_RUNS_FOR_INFERENCE`):
+  nothing counts as a boundary marker.
+
+A lost ref whose chain gap's query-side span overlaps a boundary marker is
+`assembly_gap_loss`; every other lost ref is `probable_loss` -- including
+one at the very end of its chain (no aligned block on one side, so there is
+no query-side gap span to check).
 
 This sub-categorization (plus per-ref pruning counts and pre-pruning
-category) is independent of multi-projection filtering and always runs when
-a query FASTA is supplied, written to the ref-CNEE TSV described in
+category) is independent of multi-projection filtering and always runs (the
+reference and query genomes are required inputs), written to the ref-CNEE TSV described in
 output_files.md. It does not change out_orthology's own "lost"/"unaligned"
 labels.
 

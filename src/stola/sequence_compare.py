@@ -49,6 +49,7 @@ class SequenceComparator:
         # files -- each independently either FASTA or .2bit (see genome_io.py).
         work_path = Path(work_dir)
         work_path.mkdir(parents=True, exist_ok=True)
+        self.query_path = Path(query_fasta)  # scanned for assembly gaps (orthology.py)
         self.ref = open_genome_accessor(ref_fasta, work_path / "ref_fasta.idx")
         self.query = open_genome_accessor(query_fasta, work_path / "query_fasta.idx")
 
